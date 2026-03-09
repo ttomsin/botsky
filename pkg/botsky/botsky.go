@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/davhofer/indigo/api/atproto"
 	"github.com/davhofer/indigo/api/bsky"
+	"github.com/davhofer/indigo/atproto/syntax"
 	lexutil "github.com/davhofer/indigo/lex/util"
 	"github.com/davhofer/indigo/xrpc"
 )
@@ -222,4 +224,144 @@ func (c *Client) GetPost(ctx context.Context, postUri string) (RichPost, error) 
 	}
 
 	return post, nil
+}
+
+// Like creates a 'Like' record for a specific post
+func (c *Client) Like(ctx context.Context, uri string, cid string) (string, string, error) {
+	// Build the record (Following the app.bsky.feed.like Lexicon)
+	like := &bsky.FeedLike{
+		CreatedAt: time.Now().Format(time.RFC3339),
+		Subject: &atproto.RepoStrongRef{
+			Uri: uri,
+			Cid: cid,
+		},
+	}
+
+	// Publish it to the "app.bsky.feed.like" collection in Repo
+	resp, err := atproto.RepoCreateRecord(ctx, c.xrpcClient, &atproto.RepoCreateRecord_Input{
+		Collection: "app.bsky.feed.like",
+		Repo:       c.Did,
+		Record:     &lexutil.LexiconTypeDecoder{Val: like},
+	})
+
+	if err != nil {
+		return "", "", err
+	}
+
+	return resp.Cid, resp.Uri, nil
+}
+
+// Unlike removes a 'Like' record for a specific post.
+// likeUri is the URI of the Like record itself (at://did:...)
+func (c *Client) Unlike(ctx context.Context, likeUri string) error {
+	// 1. Parse the AT-URI string into a structured object
+	parsed, err := syntax.ParseATURI(likeUri)
+	if err != nil {
+		return fmt.Errorf("invalid like URI: %w", err)
+	}
+
+	deleteRec := &atproto.RepoDeleteRecord_Input{
+		Collection: parsed.Collection().String(), // "app.bsky.feed.like"
+		Repo:       c.Did,
+		Rkey:       parsed.RecordKey().String(), // The unique ID of that specific Like
+	}
+
+	_, err = atproto.RepoDeleteRecord(ctx, c.xrpcClient, deleteRec)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Follow follows a user by their DID.
+func (c *Client) Follow(ctx context.Context, targetDid string) (string, string, error) {
+	// Build the Record (Following the app.bsky.graph.follow Lexicon)
+	follow := &bsky.GraphFollow{
+		CreatedAt: time.Now().Format(time.RFC3339),
+		Subject:   targetDid,
+	}
+
+	// Publish it to the "app.bsky.graph.follow" collection in Repo
+	resp, err := atproto.RepoCreateRecord(ctx, c.xrpcClient, &atproto.RepoCreateRecord_Input{
+		Collection: "app.bsky.graph.follow",
+		Repo:       c.Did,
+		Record:     &lexutil.LexiconTypeDecoder{Val: follow},
+	})
+
+	if err != nil {
+		return "", "", err
+	}
+
+	return resp.Cid, resp.Uri, nil
+}
+
+// Unfollow removes a 'Follow' record.
+// followUri is the URI of the Follow record itself (e.g., at://did:...)
+func (c *Client) Unfollow(ctx context.Context, followUri string) error {
+
+	// extract the collection and rkey
+
+	parsed, err := syntax.ParseATURI(followUri)
+	if err != nil {
+		return fmt.Errorf("invalid follow URI: %w", err)
+	}
+
+	deleteRec := &atproto.RepoDeleteRecord_Input{
+		Collection: parsed.Collection().String(), // app.bsky.graph.follow
+		Repo:       c.Did,
+		Rkey:       parsed.RecordKey().String(), // The unique ID of that follow
+	}
+
+	_, err = atproto.RepoDeleteRecord(ctx, c.xrpcClient, deleteRec)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type TimelinePost struct {
+	Uri         string
+	Cid         string
+	Author      string
+	AuthorDid   string
+	Text        string
+	ReplyCount  int64
+	QuoteCount  int64
+	RepostCount int64
+	LikeCount   int64
+	IndexedAt   string
+}
+
+// GetTimeline fetches the authenticated user's home timeline.
+// limit: how many posts (max 100). cursor: for pagination (optional).
+func (c *Client) GetTimeline(ctx context.Context, limit int64) ([]TimelinePost, error) {
+	// 1. Raw Indigo Call
+	out, err := bsky.FeedGetTimeline(ctx, c.xrpcClient, "", "", limit)
+	if err != nil {
+		return nil, err
+	}
+
+	var posts []TimelinePost
+	for _, item := range out.Feed {
+		// Type assertion: Is this actually a post record?
+		postRec, ok := item.Post.Record.Val.(*bsky.FeedPost)
+		if !ok {
+			continue
+		}
+
+		posts = append(posts, TimelinePost{
+			Uri:         item.Post.Uri,
+			Cid:         item.Post.Cid,
+			Author:      item.Post.Author.Handle,
+			AuthorDid:   item.Post.Author.Did,
+			Text:        postRec.Text,
+			ReplyCount:  *item.Post.ReplyCount,
+			LikeCount:   *item.Post.LikeCount,
+			RepostCount: *item.Post.RepostCount,
+			IndexedAt:   item.Post.IndexedAt,
+		})
+	}
+	return posts, nil
 }
